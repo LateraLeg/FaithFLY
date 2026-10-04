@@ -1,0 +1,4 @@
+Flask>=3.1,<4.0
+gunicorn>=23.0,<24.0
+Pillow>=11.0,<13.0
+psd-tools[composite]>=1.10,<2.0
