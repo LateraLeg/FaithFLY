@@ -1,5 +1,6 @@
 import io
 import os
+import re
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_file
@@ -19,6 +20,11 @@ FONT_PATHS = (
     "/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf",
     "C:/Windows/Fonts/georgia.ttf",
     "C:/Windows/Fonts/times.ttf",
+)
+FONT_DIRS = (
+    "C:/Windows/Fonts",
+    "/usr/share/fonts/truetype",
+    "/usr/share/fonts",
 )
 Image.MAX_IMAGE_PIXELS = 25_000_000
 
@@ -78,13 +84,9 @@ def _load_photo():
 
 
 def _load_template():
-    upload = request.files.get("template")
-    if upload is not None and upload.filename:
-        data = upload.read()
-    elif TEMPLATE_PATH.is_file():
-        data = TEMPLATE_PATH.read_bytes()
-    else:
-        raise ValueError("Upload the FaithFLY PSD template.")
+    if not TEMPLATE_PATH.is_file():
+        raise ValueError("FaithFLY.psd is missing from the backend. Keep it beside app.py and redeploy.")
+    data = TEMPLATE_PATH.read_bytes()
 
     if len(data) < 26 or data[:4] != b"8BPS":
         raise ValueError("The template must be a valid Photoshop PSD file.")
@@ -114,33 +116,134 @@ def _load_template():
     return psd, layers
 
 
-def _font(size):
+def _normalize_font_name(value):
+    if not value or not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if not value:
+        return ""
+    value = value.replace("_", " ")
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def _font_candidates(font_name):
+    normalized = _normalize_font_name(font_name)
+    names = []
+    if normalized:
+        names.extend([
+            normalized,
+            normalized.lower(),
+            normalized.replace(" ", ""),
+            normalized.replace(" ", "").lower(),
+            os.path.splitext(os.path.basename(normalized))[0],
+        ])
+    for path in FONT_PATHS:
+        if path:
+            names.append(path)
+    return names
+
+
+def _find_system_font_path(font_name):
+    candidates = _font_candidates(font_name)
+    seen = set()
+    for label in candidates:
+        if not label:
+            continue
+        query = os.path.basename(str(label)).lower()
+        if query in seen:
+            continue
+        seen.add(query)
+        for root in FONT_DIRS:
+            if not os.path.isdir(root):
+                continue
+            for file_name in os.listdir(root):
+                if not file_name.lower().endswith((".ttf", ".otf", ".ttc")):
+                    continue
+                full_path = os.path.join(root, file_name)
+                file_key = os.path.splitext(file_name)[0].lower()
+                if (
+                    label and isinstance(label, str) and (
+                        file_key == query
+                        or file_key == query.replace(" ", "")
+                        or file_key == query.replace(" ", "-")
+                        or file_key in query.replace(" ", "")
+                    )
+                ):
+                    return full_path
+                if os.path.isfile(full_path):
+                    base = os.path.splitext(file_name)[0].lower()
+                    if base == query or base == query.replace(" ", ""):
+                        return full_path
+    return None
+
+
+def _font(size, font_name=None):
+    first_choice = _find_system_font_path(font_name) if font_name else None
+    if first_choice and Path(first_choice).is_file():
+        return ImageFont.truetype(first_choice, size=size)
     for path in FONT_PATHS:
         if path and Path(path).is_file():
             return ImageFont.truetype(path, size=size)
     return ImageFont.load_default(size=size)
 
 
-def _fit_font(draw, text, max_width, max_height, start_size):
+def _fit_font(draw, text, max_width, max_height, start_size, font_name=None):
     for size in range(start_size, 17, -2):
-        font = _font(size)
+        font = _font(size, font_name)
         bounds = draw.textbbox((0, 0), text, font=font)
         if bounds[2] - bounds[0] <= max_width and bounds[3] - bounds[1] <= max_height:
             return font
-    return _font(18)
+    return _font(18, font_name)
 
 
-def _draw_solid_text(image, text, bounds, start_size, color):
+def _layer_font_name(layer):
+    seen = set()
+
+    def walk(value):
+        if not value or id(value) in seen:
+            return None
+        seen.add(id(value))
+
+        if isinstance(value, dict):
+            for key in ("font", "fontName", "font_name", "name"):
+                if key in value:
+                    font_name = value.get(key)
+                    if isinstance(font_name, str) and font_name.strip():
+                        return font_name.strip()
+            for nested in value.values():
+                result = walk(nested)
+                if result:
+                    return result
+        elif hasattr(value, "items"):
+            return walk(dict(value.items()))
+        else:
+            for attr in ("font", "fontName", "font_name", "name"):
+                if hasattr(value, attr):
+                    font_name = getattr(value, attr)
+                    if isinstance(font_name, str) and font_name.strip():
+                        return font_name.strip()
+            for attr in ("text", "engine_dict", "resource_dict"):
+                if hasattr(value, attr):
+                    result = walk(getattr(value, attr))
+                    if result:
+                        return result
+        return None
+
+    return walk(layer)
+
+
+def _draw_solid_text(image, text, bounds, start_size, color, font_name=None):
     left, top, right, bottom = bounds
     draw = ImageDraw.Draw(image)
-    font = _fit_font(draw, text, right - left, bottom - top, start_size)
+    font = _fit_font(draw, text, right - left, bottom - top, start_size, font_name=font_name)
     draw.text(((left + right) // 2, (top + bottom) // 2), text, fill=color, font=font, anchor="mm")
 
 
-def _draw_program_text(image, text, bounds):
+def _draw_program_text(image, text, bounds, font_name=None):
     left, top, right, bottom = bounds
     draw = ImageDraw.Draw(image)
-    font = _fit_font(draw, text, right - left, bottom - top, 125)
+    font = _fit_font(draw, text, right - left, bottom - top, 125, font_name=font_name)
     center = ((left + right) // 2, (top + bottom) // 2)
     mask = Image.new("L", image.size, 0)
     ImageDraw.Draw(mask).text(center, text, fill=255, font=font, anchor="mm")
@@ -161,23 +264,42 @@ def _draw_program_text(image, text, bounds):
     image.paste(Image.composite(gradient, image, mask))
 
 
+def _apply_text_to_layer(layer, value):
+    try:
+        if hasattr(layer, "text"):
+            layer.text = value
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _render_flyer(photo, title, program, place):
     psd, layers = _load_template()
-    canvas = psd.composite().convert("RGB")
+
+    text_layers = {
+        "Title here": title,
+        "Program name": program,
+        "Place here": place,
+    }
+    for layer_name, value in text_layers.items():
+        layer = layers[layer_name]
+        if not _apply_text_to_layer(layer, value):
+            raise ValueError(f"The PSD layer '{layer_name}' is not editable as text. Keep it as a text layer in the design and try again.")
+
+    canvas = psd.composite().convert("RGBA")
 
     photo_layer = layers["Photo here"]
     left, top, right, bottom = photo_layer.bbox
     if right <= left or bottom <= top:
         raise ValueError("The template photo layer has invalid dimensions.")
-    fitted_photo = ImageOps.fit(photo, (right - left, bottom - top), method=Image.Resampling.LANCZOS)
-    canvas.paste(fitted_photo.convert("RGB"), (left, top))
 
-    _draw_solid_text(canvas, title, layers["Title here"].bbox, 38, "white")
-    _draw_program_text(canvas, program, layers["Program name"].bbox)
-    _draw_solid_text(canvas, place, layers["Place here"].bbox, 58, "white")
+    fitted_photo = ImageOps.fit(photo, (right - left, bottom - top), method=Image.Resampling.LANCZOS)
+    fitted_photo = fitted_photo.convert("RGBA")
+    canvas.paste(fitted_photo, (left, top), fitted_photo)
 
     output = io.BytesIO()
-    canvas.save(output, format="JPEG", quality=92, optimize=True)
+    canvas.convert("RGB").save(output, format="JPEG", quality=92, optimize=True)
     output.seek(0)
     return output
 
